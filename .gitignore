@@ -1,0 +1,36 @@
+
+# Gradle
+.gradle/
+**/build/
+
+# Android Studio
+.idea/
+*.iml
+local.properties
+
+# Firebase
+google-services.json
+*serviceAccount*.json
+*firebase-adminsdk*.json
+
+# Signing keys
+*.jks
+*.keystore
+keystore.properties
+key.properties
+
+# Secrets
+.env
+.env.*
+secrets.properties
+
+# Compiled files
+*.apk
+*.aab
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
