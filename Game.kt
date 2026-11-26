@@ -67,7 +67,7 @@ class FallingButton(
 
 class Game {
     // UI language is independent of the device locale and gameplay identifiers.
-    var language: String = "ru"
+    var language: String = "en"
     fun t(value: String): String {
         if (language != "en") return value
         val translated = englishUi[value]
@@ -83,6 +83,19 @@ class Game {
     }
 
     private val englishUi: Map<String, String> = mapOf(
+        "Аккаунт" to "Account",
+        "АККАУНТ" to "ACCOUNT",
+        "Гостевой профиль" to "Guest profile",
+        "Постоянный аккаунт" to "Registered account",
+        "Войти" to "Sign in",
+        "Регистрация" to "Register",
+        "Восстановить пароль" to "Reset password",
+        "Выйти из аккаунта" to "Sign out",
+        "Повторить" to "Retry",
+        "Не удалось загрузить профиль" to "Could not load profile",
+        "Операция выполняется..." to "Please wait...",
+        "Не удалось сохранить ник" to "Could not save nickname",
+        "Ник: 1–24 символа, без /" to "Nickname: 1–24 characters, no /",
         "ИЗМЕНИТЬ НИК" to "CHANGE NICKNAME",
         "ВВЕДИТЕ ВАШ НИК" to "ENTER YOUR NICKNAME",
         "Нажмите чтобы ввести" to "Tap to enter",
@@ -166,6 +179,15 @@ class Game {
         "Не удалось проверить ник. Проверь интернет и правила Firestore." to "Could not verify nickname. Check your connection and Firestore rules."
     )
     var languageBtnRect = RectF()
+    var accountBtnRect = RectF()
+    var nameAccountBtnRect = RectF()
+    val accountButtons = Array(5) { RectF() }
+    var accountReturnState = State.MENU
+    @Volatile var accountIsGuest = true
+    @Volatile var accountBusy = false
+    var accountStatus = ""
+    var accountLoadError = false
+    var retryAccountBtn = RectF()
 
     var paddleX = 0f
     val paddleW = 250f
@@ -186,7 +208,7 @@ class Game {
 
     var score = 0
     var highScore = 0
-    var state = State.MENU
+    @Volatile var state = State.MENU
 
     var viewWidth = 0
     var viewHeight = 0
@@ -456,8 +478,9 @@ class Game {
     fun update(dt: Float, safe: Rect, screenWidth: Int, paddleY: Float) {
         languageSwitchAnim = (languageSwitchAnim + dt * 5f).coerceAtMost(1f)
         if (!isInitialized) {
+            val initialState = state
             reset(screenWidth, safe)
-            state = State.MENU
+            state = initialState
             menuAnimProgress = 0f
             isInitialized = true
         }
@@ -517,8 +540,8 @@ class Game {
 
                 if (!orbsAwarded) {
                     orbsAwarded = true
-                    earnedOrbs = score * 2
-                    totalOrbs += earnedOrbs
+                    earnedOrbs = (score.toLong() * 2L).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                    totalOrbs = (totalOrbs.toLong() + earnedOrbs).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
                     saveOrbsCallback?.invoke(totalOrbs)
 
                     if (earnedOrbs > 0) {
@@ -752,6 +775,11 @@ class Game {
         "Мультишар", "MultiBall" -> "multi"
         "Назад", "Back" -> "back"
         "В главное меню", "Main menu" -> "home"
+        "Аккаунт", "Account", "Регистрация", "Register" -> "user"
+        "Войти", "Sign in" -> "login"
+        "Восстановить пароль", "Reset password" -> "lock"
+        "Выйти из аккаунта", "Sign out" -> "exit"
+        "Повторить", "Retry" -> "restart"
         "Изменить ник", "Change nickname" -> "edit"
         "Загрузить фон", "Upload background" -> "image"
         "Сбросить фон", "Reset background" -> "resetImage"
@@ -786,6 +814,9 @@ class Game {
             path(3f, 4f, 3f, 10f, 9f, 10f)
         }
         when (kind) {
+            "user" -> { circle(12f, 7f, 4f); c.drawArc(4f, 12f, 20f, 27f, 180f, 180f, false, ip) }
+            "login" -> { path(13f, 3f, 21f, 3f, 21f, 21f, 13f, 21f); line(3f, 12f, 16f, 12f); path(11f, 7f, 16f, 12f, 11f, 17f) }
+            "lock" -> { c.drawRoundRect(5f, 10f, 19f, 21f, 2f, 2f, ip); c.drawArc(8f, 2f, 16f, 16f, 180f, 180f, false, ip); line(12f, 14f, 12f, 17f) }
             "play" -> path(7f, 3f, 20f, 12f, 7f, 21f, 7f, 3f)
             "gamepad" -> { c.drawRoundRect(2f, 6f, 22f, 18f, 5f, 5f, ip); line(5f, 12f, 11f, 12f); line(8f, 9f, 8f, 15f); circle(16f, 10f, 0.8f); circle(19f, 14f, 0.8f) }
             "trophy" -> { path(7f, 3f, 17f, 3f, 17f, 9f, 15f, 13f, 9f, 13f, 7f, 9f, 7f, 3f); path(7f, 5f, 3f, 5f, 3f, 9f, 7f, 11f); path(17f, 5f, 21f, 5f, 21f, 9f, 17f, 11f); line(12f, 13f, 12f, 21f); line(7f, 21f, 17f, 21f) }
@@ -918,7 +949,8 @@ class Game {
             }
 
             val p3 = easeOutCubic((menuAnimProgress - 0.3f).coerceIn(0f, 1f))
-            if (p3 > 0) {
+            nameDeclineBtnRect.setEmpty()
+            if (p3 > 0 && (isFromSettings || accountIsGuest)) {
                 c.save(); c.translate(0f, (1f - p3) * 200f)
                 nameDeclineBtnRect.set(c.width / 2f - 300f, c.height / 2f + 200f, c.width / 2f + 300f, c.height / 2f + 300f)
                 val declineText = t(if (isFromSettings) "Отмена" else "Отказаться")
@@ -927,6 +959,54 @@ class Game {
                 c.restore()
             }
 
+            nameAccountBtnRect.setEmpty()
+            if (!isFromSettings && menuAnimProgress > 0.4f) {
+                val w = min(600f, c.width * 0.85f)
+                val top = c.height / 2f + 325f + (1f - easeOutCubic(menuAnimProgress)) * 100f
+                nameAccountBtnRect.set(c.width / 2f - w / 2f, top, c.width / 2f + w / 2f, top + 75f)
+                drawButton(c, nameAccountBtnRect, "Аккаунт", colorSecondary, textSize = 42f)
+            }
+            c.restore()
+            return
+        }
+
+        if (state == State.AUTH_LOADING || state == State.ACCOUNT) {
+            c.drawColor(colorBg)
+            val w = min(550f, c.width * 0.86f)
+            val available = (c.height - safe.top - safe.bottom).toFloat().coerceAtLeast(1f)
+            val h = min(75f, available / 10f)
+            val cx = c.width / 2f
+            val cy = safe.top + available / 2f
+            val progress = easeOutCubic(menuAnimProgress.coerceIn(0f, 1f))
+            paint.color = colorPrimary; paint.textAlign = Paint.Align.CENTER; paint.textSize = min(68f, w / 7f)
+            c.save(); c.translate(cx, cy - h * 3.7f); c.scale(progress, progress)
+            c.drawText(t(if (state == State.ACCOUNT) "АККАУНТ" else "ball"), 0f, 0f, paint)
+            c.restore()
+            paint.color = colorSubText; paint.textSize = min(38f, w / 15f)
+            val info = if (state == State.AUTH_LOADING) {
+                if (accountLoadError) t("Не удалось загрузить профиль") else t("Загрузка...")
+            } else if (accountBusy) t("Операция выполняется...") else t(if (accountIsGuest) "Гостевой профиль" else "Постоянный аккаунт")
+            c.drawText(info, cx, cy - h * 2.8f, paint)
+            if (state == State.AUTH_LOADING) {
+                retryAccountBtn.setEmpty()
+                if (accountLoadError) {
+                    retryAccountBtn.set(cx - w / 2f, cy, cx + w / 2f, cy + h)
+                    drawButton(c, retryAccountBtn, "Повторить", colorPrimary, textSize = 42f)
+                }
+            } else {
+                val labels = if (accountIsGuest) listOf("Регистрация", "Войти", "Восстановить пароль", "Назад")
+                    else listOf("Восстановить пароль", "Выйти из аккаунта", "Назад")
+                for (r in accountButtons) r.setEmpty()
+                for ((i, label) in labels.withIndex()) {
+                    val p = easeOutCubic((menuAnimProgress - i * 0.08f).coerceIn(0f, 1f))
+                    if (p <= 0f) continue
+                    val top = cy - h * 1.8f + i * h * 1.25f + (1f - p) * 100f
+                    val rect = accountButtons[i]
+                    rect.set(cx - w / 2f, top, cx + w / 2f, top + h)
+                    val bg = when (label) { "Регистрация" -> colorPrimary; "Выйти из аккаунта" -> colorDanger; else -> colorSecondary }
+                    drawButton(c, rect, label, bg, textSize = 42f)
+                }
+            }
             c.restore()
             return
         }
@@ -1118,6 +1198,10 @@ class Game {
                 paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
                 c.restore()
 
+                val accountW = min(300f, c.width * 0.45f)
+                val accountY = safe.top + 65f + getMenuOffsetY(0.4f)
+                accountBtnRect.set(c.width / 2f - accountW / 2f, accountY, c.width / 2f + accountW / 2f, accountY + 60f)
+                drawButton(c, accountBtnRect, "Аккаунт", colorSecondary, textSize = 35f)
                 val btnW = 550f; val btnH = 75f
                 val left = c.width / 2f - btnW / 2f; val right = c.width / 2f + btnW / 2f
 
@@ -1688,62 +1772,62 @@ class Game {
 
                 popupRect.set(c.width / 2f - popupW / 2f, currentY, c.width / 2f + popupW / 2f, currentY + popupH)
 
-                краска.цвет = цветВторичный
-                c.drawRoundRect(popupRect, 16ф, 16ф, краска)
-                paint.style = Paint.Style.STROKE; paint.color = Color.parseColor("#55FFFFFF"); paint.strokeWidth = 2ф
-                c.drawRoundRect(popupRect, 16ф, 16ф, краска); краска.стиль = Краска.стиль.ЗАПОЛНИТЬ
+                paint.color = colorSecondary
+                c.drawRoundRect(popupRect, 16f, 16f, paint)
+                paint.style = Paint.Style.STROKE; paint.color = Color.parseColor("#55FFFFFF"); paint.strokeWidth = 2f
+                c.drawRoundRect(popupRect, 16f, 16f, paint); paint.style = Paint.Style.FILL
 
                 paint.textAlign = Paint.Align.CENTER
 
                 paint.color = Color.parseColor("#FFD700")
-                краска.textSize = 35ф
-                c.drawText(t("новое достижение!"), popupRect.centerX(), popupRect.top + 45ф, краска)
+                paint.textSize = 35f
+                c.drawText(t("новое достижение!"), popupRect.centerX(), popupRect.top + 45f, paint)
 
-                краска.цвет = цветТекст
-                краска.textSize = 50ф
-                c.drawText(t(popupTitle), popupRect.centerX(), popupRect.top + 105ф, краска)
+                paint.color = colorText
+                paint.textSize = 50f
+                c.drawText(t(popupTitle), popupRect.centerX(), popupRect.top + 105f, paint)
 
-                краска.цвет = цветПодтекст
-                краска.textSize = 30ф
-                c.drawText(t("коснись чтобы посмотреть описание"), popupRect.centerX(), popupRect.top + 155ф, краска)
+                paint.color = colorSubText
+                paint.textSize = 30f
+                c.drawText(t("коснись чтобы посмотреть описание"), popupRect.centerX(), popupRect.top + 155f, paint)
             }
         }
 
-        эсли (showConfirmDialog) {
-            краска.цвет = Цвет.аргб((150 * добавитьDialogAnim).toInt(), 0, 0, 0)
-            c.drawRect(0ф, 0ф, c.shirina.toFloat(), c.vysota.toFloat(), краска)
+        if (showConfirmDialog) {
+            paint.color = Color.argb((150 * confirmDialogAnim).toInt(), 0, 0, 0)
+            c.drawRect(0f, 0f, c.width.toFloat(), c.height.toFloat(), paint)
 
-            вал animScale = easeOutBack (подвергнутьDialogAnim)
+            val animScale = easeOutBack(confirmDialogAnim)
 
-            с.сохранить()
-            c.translate(c.width / 2ф, в.высота / 2ф)
+            c.save()
+            c.translate(c.width / 2f, c.height / 2f)
             c.scale(animScale, animScale)
 
-            вал дялогW = 800ф
-            вал диалогH = 400ф
-            вал диалогRect = RectF(-dialogW/2, -диалогХ/2, дialogW/2, диалогH/2)
+            val dialogW = 800f
+            val dialogH = 400f
+            val dialogRect = RectF(-dialogW/2, -dialogH/2, dialogW/2, dialogH/2)
 
-            краска.цвет = цветВторичный
-            c.drawRoundRect(dialogRect, 30ф, 30ф, краска)
+            paint.color = colorSecondary
+            c.drawRoundRect(dialogRect, 30f, 30f, paint)
 
-            краска.цвет = цветТекст
-            краска.textSize = 50ф
+            paint.color = colorText
+            paint.textSize = 50f
             paint.textAlign = Paint.Align.CENTER
-            c.drawText(t(confirmText), 0ф, -40ф, краска)
+            c.drawText(t(confirmText), 0f, -40f, paint)
 
-            вал btnW = 300ф
-            вал btnH = 80ф
-            добавитьДаBtnRect.набор(-btnW - 20ф, 50ф, -20ф, 50ф + btnH)
-            добавитьNoBtnRect.nabor(20ф, 50ф, 20ф + btnW, 50ф + btnH)
+            val btnW = 300f
+            val btnH = 80f
+            confirmYesBtnRect.set(-btnW - 20f, 50f, -20f, 50f + btnH)
+            confirmNoBtnRect.set(20f, 50f, 20f + btnW, 50f + btnH)
 
-            drawButton(c, добавитьДаBtnRect, "Да", цветОпасность, размер текста = 45ф)
-            drawButton(c, добавитьNoBtnRect, "Отмена", цветОсновной, размер текста = 45ф)
+            drawButton(c, confirmYesBtnRect, "Да", colorDanger, textSize = 45f)
+            drawButton(c, confirmNoBtnRect, "Отмена", colorPrimary, textSize = 45f)
 
-            в.востстановитьь()
+            c.restore()
         }
 
-        в.востстановитьь()
+        c.restore()
     }
 
-    перечистное красс Состояние { МЕНЮ, NAME_ENTRY, РЕЖИМЫ, ИГРА, ПРИОСТАНОВИЛО, НАСТРОИКИ, ДОСТИЖИНИЯ, GAME_OVER, CROPPING_BALL, CROPPING_BG, PARTICLE_COLORS, ТАБЛИЦА ЛИДЕРОВ, LEADERBOARD_MODES }
+    enum class State { MENU, NAME_ENTRY, MODES, PLAYING, PAUSED, SETTINGS, ACHIEVEMENTS, GAME_OVER, CROPPING_BALL, CROPPING_BG, PARTICLE_COLORS, LEADERBOARD, LEADERBOARD_MODES, AUTH_LOADING, ACCOUNT }
 }

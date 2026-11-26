@@ -15,126 +15,90 @@ data class LeaderboardEntry(
 class LeaderboardManager {
     private val db = FirebaseFirestore.getInstance()
     private val auth = FirebaseAuth.getInstance()
+    private val modes = listOf("Classic", "Tilt", "Hearts", "MultiBall")
+    private fun profile(uid: String) = db.collection("accounts_v6").document(uid)
+    private fun scoreRef(uid: String, mode: String) = db.collection("leaderboard").document("${uid}_$mode")
 
-    fun signInAnonymously(onComplete: (Boolean) -> Unit) {
-        if (auth.currentUser != null) {
-            onComplete(true)
-            return
-        }
-        auth.signInAnonymously().addOnCompleteListener { task ->
-            onComplete(task.isSuccessful)
-        }
+    fun loadProfile(onResult: (String?, List<Int>, String?) -> Unit) {
+        val uid = auth.currentUser?.uid ?: run { onResult(null, emptyList(), "Auth required"); return }
+        db.runTransaction { tx ->
+            val p = tx.get(profile(uid))
+            val scores = modes.map { mode ->
+                val s = tx.get(scoreRef(uid, mode))
+                if (s.getString("ownerUid") == uid) (s.getLong("score") ?: 0L).coerceIn(0, Int.MAX_VALUE.toLong()).toInt() else 0
+            }
+            Pair(p.getString("name"), scores)
+        }.addOnSuccessListener { result -> onResult(result.first, result.second, null) }
+            .addOnFailureListener { onResult(null, emptyList(), "Profile unavailable") }
     }
 
-    fun checkAndSaveNickname(
-        playerId: String,
-        oldName: String,
-        newName: String,
-        onResult: (Boolean, String?) -> Unit
-    ) {
-        val cleanName = newName.trim()
-
-        if (cleanName.isBlank()) {
-            onResult(false, "Введите ник!")
-            return
+    @Suppress("UNUSED_PARAMETER")
+    fun checkAndSaveNickname(playerId: String, oldName: String, newName: String, onResult: (Boolean, String?) -> Unit) {
+        val uid = auth.currentUser?.uid
+        if (uid == null || uid != playerId) { onResult(false, "Не удалось сохранить ник"); return }
+        val name = newName.trim()
+        if (name.isEmpty()) { onResult(false, "Введите ник!"); return }
+        if (name.length > 24 || '/' in name || name == "." || name == ".." ||
+            (name.startsWith("__") && name.endsWith("__")) || name.any { it.isISOControl() }) {
+            onResult(false, "Ник: 1–24 символа, без /"); return
         }
-        if (cleanName.contains("/")) {
-            onResult(false, "Ник не может содержать /")
-            return
-        }
-
         val names = db.collection("nicknames")
-        val newRef = names.document(cleanName)
-        val oldRef = if (oldName.isNotBlank() && oldName != cleanName) {
-            names.document(oldName)
-        } else null
-
-        db.runTransaction { transaction ->
-            // Все чтения должны выполняться до любых записей в транзакции.
-            val newSnapshot = transaction.get(newRef)
-            val oldSnapshot = oldRef?.let { transaction.get(it) }
-            val ownerId = newSnapshot.getString("playerId")
-
-            if (newSnapshot.exists() && ownerId != playerId) {
-                throw IllegalStateException("Этот ник уже занят!")
-            }
-
-            transaction.set(newRef, mapOf("playerId" to playerId))
-            if (oldRef != null && oldSnapshot?.getString("playerId") == playerId) {
-                transaction.delete(oldRef)
+        val newRef = names.document(name)
+        val profileRef = profile(uid)
+        db.runTransaction { tx ->
+            val p = tx.get(profileRef)
+            val previous = p.getString("name")
+            val oldRef = previous?.takeIf { it != name }?.let { names.document(it) }
+            val newDoc = tx.get(newRef)
+            val oldDoc = oldRef?.let { tx.get(it) }
+            val scores = modes.map { mode -> tx.get(scoreRef(uid, mode)) }
+            if (newDoc.exists() && newDoc.getString("ownerUid") != uid) throw IllegalStateException("nickname_taken")
+            if (oldDoc != null && oldDoc.exists() && oldDoc.getString("ownerUid") != uid) throw IllegalStateException("owner_mismatch")
+            if (!newDoc.exists()) tx.set(newRef, mapOf("playerId" to uid, "ownerUid" to uid))
+            tx.set(profileRef, mapOf("name" to name))
+            if (oldRef != null && oldDoc?.exists() == true) tx.delete(oldRef)
+            for (score in scores) {
+                if (score.exists() && score.getString("ownerUid") == uid && score.getString("name") != name) {
+                    tx.update(score.reference, "name", name)
+                }
             }
             true
-        }.addOnSuccessListener {
-            // Обновляем отображаемый ник в существующих записях рейтинга.
-            for (mode in listOf("Classic", "Tilt", "Hearts", "MultiBall")) {
-                val docId = "${playerId}_$mode"
-                db.collection("leaderboard").document(docId).update("name", cleanName)
+        }.addOnSuccessListener { onResult(true, null) }
+            .addOnFailureListener { e ->
+                val taken = generateSequence<Throwable>(e) { it.cause }.any { it.message == "nickname_taken" }
+                onResult(false, if (taken) "Этот ник уже занят!" else "Не удалось сохранить ник")
             }
-            onResult(true, null)
-        }.addOnFailureListener { e ->
-            val message = if (e is IllegalStateException && e.message == "Этот ник уже занят!") {
-                "Этот ник уже занят!"
-            } else {
-                "Не удалось проверить ник. Проверь интернет и правила Firestore."
-            }
-            onResult(false, message)
-        }
     }
 
-    fun submitScore(
-        playerId: String,
-        playerName: String,
-        score: Int,
-        mode: String,
-        onResult: (Boolean, String?) -> Unit
-    ) {
-        val docId = "${playerId}_$mode"
-        val docRef = db.collection("leaderboard").document(docId)
-
-        docRef.get().addOnSuccessListener { document ->
-            if (document.exists()) {
-                val oldScore = document.getLong("score") ?: 0L
-                val oldName = document.getString("name") ?: ""
-                if (score.toLong() > oldScore || playerName != oldName) {
-                    val updates = hashMapOf<String, Any>(
-                        "name" to playerName,
-                        "score" to maxOf(score.toLong(), oldScore),
-                        "timestamp" to FieldValue.serverTimestamp()
-                    )
-                    docRef.update(updates)
-                        .addOnSuccessListener { onResult(true, null) }
-                        .addOnFailureListener { e -> onResult(false, e.message) }
-                } else {
-                    onResult(true, null)
-                }
-            } else {
-                val entry = hashMapOf(
-                    "name" to playerName,
-                    "score" to score.toLong(),
-                    "mode" to mode,
-                    "timestamp" to FieldValue.serverTimestamp()
-                )
-                docRef.set(entry)
-                    .addOnSuccessListener { onResult(true, null) }
-                    .addOnFailureListener { e -> onResult(false, e.message) }
+    @Suppress("UNUSED_PARAMETER")
+    fun submitScore(playerId: String, playerName: String, score: Int, mode: String, onResult: (Boolean, String?) -> Unit) {
+        val uid = auth.currentUser?.uid
+        if (uid == null || uid != playerId || mode !in modes || score < 0) { onResult(false, "Invalid score"); return }
+        val ref = scoreRef(uid, mode)
+        db.runTransaction { tx ->
+            val p = tx.get(profile(uid))
+            val previous = tx.get(ref)
+            val name = p.getString("name") ?: throw IllegalStateException("Nickname required")
+            if (previous.exists() && previous.getString("ownerUid") != uid) throw IllegalStateException("Owner mismatch")
+            val old = previous.getLong("score") ?: 0L
+            if (!previous.exists() || score.toLong() > old) {
+                tx.set(ref, mapOf("name" to name, "score" to maxOf(old, score.toLong()), "mode" to mode,
+                    "ownerUid" to uid, "timestamp" to FieldValue.serverTimestamp()))
             }
-        }.addOnFailureListener { e ->
-            onResult(false, e.message)
-        }
+            true
+        }.addOnSuccessListener { onResult(true, null) }
+            .addOnFailureListener { onResult(false, "Score not saved") }
     }
 
     fun fetchTopScores(mode: String, onResult: (List<LeaderboardEntry>, String?) -> Unit) {
-        db.collection("leaderboard")
-            .whereEqualTo("mode", mode)
-            .orderBy("score", Query.Direction.DESCENDING)
-            .limit(50)
-            .get()
+        if (mode !in modes) { onResult(emptyList(), "Invalid mode"); return }
+        db.collection("leaderboard").whereEqualTo("mode", mode)
+            .orderBy("score", Query.Direction.DESCENDING).limit(50).get()
             .addOnSuccessListener { documents ->
-                val list = documents.mapNotNull { it.toObject(LeaderboardEntry::class.java) }
+                val list = documents.mapNotNull { doc ->
+                    try { doc.toObject(LeaderboardEntry::class.java) } catch (_: Exception) { null }
+                }
                 onResult(list, null)
-            }
-            .addOnFailureListener { e ->
-                onResult(emptyList(), e.message)
-            }
+            }.addOnFailureListener { onResult(emptyList(), it.message) }
     }
 }

@@ -13,6 +13,9 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import java.util.UUID
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -22,7 +25,7 @@ import android.view.SurfaceView
 import android.widget.Toast
 import java.io.File
 import java.io.FileOutputStream
-import java.util.UUID
+import com.google.firebase.auth.FirebaseAuth
 import kotlin.math.abs
 import kotlin.math.hypot
 
@@ -33,7 +36,202 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
     private val leaderboard = LeaderboardManager()
     private var leaderboardRequestId = 0
-    private val prefs = context.getSharedPreferences("GamePrefs", Context.MODE_PRIVATE)
+    private val devicePrefs = context.getSharedPreferences("GamePrefs", Context.MODE_PRIVATE)
+    private val uid = requireNotNull(FirebaseAuth.getInstance().currentUser).uid
+    private val prefs = context.getSharedPreferences("GameProfile_$uid", Context.MODE_PRIVATE)
+    private val progress = ProgressManager()
+    private val progressHandler = Handler(Looper.getMainLooper())
+    private var progressReady = false
+    private val scoresInFlight = mutableSetOf<Int>()
+    private var progressInFlight = false
+    private var progressWarned = false
+    private var progressAttached = false
+    private val progressSoon = Runnable { syncProgress() }
+    private val progressPeriodic = object : Runnable {
+        override fun run() {
+            if (!progressAttached) return
+            syncProgress()
+            progressHandler.postDelayed(this, 30_000L)
+        }
+    }
+    private var scoreSavedForRound = false
+    private var profileLoading = false
+    private var nicknameSaving = false
+    private var legacyNotice = false
+    var onAccountAction: ((String) -> Unit)? = null
+
+    private fun initProgressStorage() {
+        if (!prefs.contains("progress_device")) {
+            prefs.edit().putString("progress_device", UUID.randomUUID().toString())
+                .putInt("progress_base_orbs", prefs.getInt("total_orbs", 0).coerceAtLeast(0))
+                .putLong("progress_earned", 0L).commit()
+        }
+    }
+
+    private fun progressChanged() {
+        progressHandler.removeCallbacks(progressSoon)
+        progressHandler.postDelayed(progressSoon, 1_000L)
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        progressAttached = true
+        progressHandler.removeCallbacks(progressPeriodic)
+        progressHandler.post(progressPeriodic)
+    }
+
+    override fun onDetachedFromWindow() {
+        progressAttached = false
+        progressHandler.removeCallbacks(progressPeriodic)
+        progressHandler.removeCallbacks(progressSoon)
+        super.onDetachedFromWindow()
+    }
+
+    @Synchronized
+    fun syncProgress() {
+        if (!progressAttached || !progressReady || windowVisibility != android.view.View.VISIBLE || FirebaseAuth.getInstance().currentUser?.uid != uid) return
+        sendPendingScores()
+        if (progressInFlight) return
+        val snapshot = ProgressSnapshot(
+            prefs.getString("progress_device", "").orEmpty(),
+            prefs.getInt("progress_base_orbs", 0), prefs.getLong("progress_earned", 0L),
+            progressScoreKeys.map { prefs.getInt(it, 0).coerceAtLeast(0) },
+            progressAchievementIds.filter { prefs.getBoolean("ach_${it}_v3", false) }.toSet(),
+            (0..3).filter { prefs.getBoolean("played_mode_$it", false) }.map { it.toString() }.toSet(),
+            prefs.getString("progress_epoch", "").orEmpty(), prefs.getString("progress_reset_pending", "").orEmpty()
+        )
+        if (snapshot.device.isBlank()) return
+        progressInFlight = true
+        progress.sync(uid, snapshot) { result ->
+            synchronized(this) {
+                progressInFlight = false
+                if (!progressAttached || FirebaseAuth.getInstance().currentUser?.uid != uid) return@synchronized
+                if (result == null) {
+                    if (!progressWarned) {
+                        progressWarned = true
+                        Toast.makeText(context, if (game.language == "en") "Cloud sync unavailable. Progress kept on this device." else "Облако недоступно. Прогресс сохранён на устройстве.", Toast.LENGTH_SHORT).show()
+                    }
+                    return@synchronized
+                }
+                progressWarned = false
+                val earnedNow = prefs.getLong("progress_earned", 0L)
+                val pending = prefs.getString("progress_reset_pending", "").orEmpty()
+                val knownEpoch = prefs.getString("progress_epoch", "").orEmpty()
+                val newResetQueued = pending != snapshot.pendingReset
+                val editor = prefs.edit()
+                val orbs = (result.orbs.toLong() + (earnedNow - result.acknowledgedEarned).coerceIn(0L, Int.MAX_VALUE.toLong())).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                editor.putInt("total_orbs", orbs).putLong("progress_earned", maxOf(earnedNow, result.acknowledgedEarned))
+                for ((i, key) in progressScoreKeys.withIndex()) {
+                    editor.putInt(key, maxOf(prefs.getInt(key, 0), result.scores[i]))
+                }
+                if (!newResetQueued) {
+                    val mergeNow = knownEpoch == result.epoch || (pending.isNotEmpty() && pending == result.epoch)
+                    for (ach in game.achievementsList) {
+                        val unlocked = ach.id in result.achievements || (mergeNow && prefs.getBoolean("ach_${ach.id}_v3", false))
+                        editor.putBoolean("ach_${ach.id}_v3", unlocked)
+                        ach.isUnlocked = unlocked
+                    }
+                    for (i in 0..3) {
+                        editor.putBoolean("played_mode_$i", i.toString() in result.played || (mergeNow && prefs.getBoolean("played_mode_$i", false)))
+                    }
+                    editor.putString("progress_epoch", result.epoch)
+                    if (pending.isNotEmpty() && pending == result.acknowledgedReset) editor.remove("progress_reset_pending")
+                }
+                editor.apply()
+                game.totalOrbs = orbs
+                loadHighScore()
+                checkGlobalAchievements()
+                if (newResetQueued || earnedNow > result.acknowledgedEarned) progressChanged()
+            }
+        }
+    }
+
+    private fun migrateLocalProgress() {
+        if (devicePrefs.getBoolean("account_migration_done", false)) return
+        // Preserve old device progress locally, never transfer ownership of old server documents.
+        if (FirebaseAuth.getInstance().currentUser?.isAnonymous == true &&
+            devicePrefs.getString("player_id", "").orEmpty().isNotEmpty()) {
+            val editor = prefs.edit()
+            for ((key, value) in devicePrefs.all) {
+                if (key.startsWith("high_") || key.startsWith("ach_") || key.startsWith("played_mode_") || key == "total_orbs") {
+                    when (value) {
+                        is Int -> editor.putInt(key, maxOf(prefs.getInt(key, 0), value))
+                        is Boolean -> editor.putBoolean(key, prefs.getBoolean(key, false) || value)
+                    }
+                }
+            }
+            if (!editor.commit()) return
+            legacyNotice = true
+        }
+        devicePrefs.edit().putBoolean("account_migration_done", true).commit()
+    }
+
+    fun loadAccountProfile() {
+        if (profileLoading) return
+        profileLoading = true
+        game.accountLoadError = false
+        game.openMenu(Game.State.AUTH_LOADING)
+        leaderboard.loadProfile { name, scores, error ->
+            post {
+                profileLoading = false
+                if (FirebaseAuth.getInstance().currentUser?.uid != uid) return@post
+                game.accountIsGuest = FirebaseAuth.getInstance().currentUser?.isAnonymous == true
+                if (error != null) {
+                    // Only this UID's previously confirmed nickname is eligible for offline use.
+                    val cached = prefs.getString("player_name", "").orEmpty()
+                    if (cached.isEmpty()) {
+                        game.accountLoadError = true
+                        return@post
+                    }
+                    game.playerName = cached
+                } else {
+                    game.playerName = name.orEmpty()
+                    val editor = prefs.edit().putString("player_name", game.playerName)
+                    for ((i, key) in listOf("high_classic", "high_tilt", "high_hearts", "high_multiball").withIndex()) {
+                        editor.putInt(key, maxOf(prefs.getInt(key, 0), scores.getOrElse(i) { 0 }))
+                    }
+                    editor.apply()
+                    loadHighScore()
+                }
+                progressReady = true
+                syncProgress()
+                game.previousStateForName = Game.State.MENU
+                game.openMenu(if (game.playerName.isBlank()) Game.State.NAME_ENTRY else Game.State.MENU)
+                if (legacyNotice) {
+                    legacyNotice = false
+                    Toast.makeText(context, if (game.language == "en") "Old scores remain in the leaderboard. Choose a new nickname; local progress is preserved." else "Старые рекорды остались в рейтинге. Выберите новый ник; локальный прогресс сохранён.", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun openAccount(from: Game.State) {
+        onHideKeyboard?.invoke()
+        game.accountReturnState = from
+        game.accountIsGuest = FirebaseAuth.getInstance().currentUser?.isAnonymous == true
+        game.openMenu(Game.State.ACCOUNT)
+    }
+
+    private fun saveNickname(name: String, random: Boolean = false) {
+        if (nicknameSaving) return
+        nicknameSaving = true
+        val old = prefs.getString("player_name", "").orEmpty()
+        leaderboard.checkAndSaveNickname(uid, old, name) { success, error ->
+            post {
+                nicknameSaving = false
+                if (FirebaseAuth.getInstance().currentUser?.uid != uid) return@post
+                if (success) {
+                    game.playerName = name.trim()
+                    prefs.edit().putString("player_name", game.playerName).apply()
+                    game.openMenu(game.previousStateForName)
+                    progressChanged()
+                } else {
+                    if (random) game.playerName = ""
+                    game.errorMessage = error ?: "Не удалось сохранить ник"
+                }
+            }
+        }
+    }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
@@ -62,37 +260,25 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private var lastZ = 0f
 
     init {
-        game.language = prefs.getString("ui_language", "ru").let { if (it == "en") "en" else "ru" }
+        game.language = devicePrefs.getString("ui_language", "en").let { if (it == "ru") "ru" else "en" }
         holder.addCallback(this)
 
-        var playerId = prefs.getString("player_id", "") ?: ""
-        if (playerId.isEmpty()) {
-            playerId = UUID.randomUUID().toString()
-            prefs.edit().putString("player_id", playerId).apply()
-        }
-        game.playerId = playerId
+        migrateLocalProgress()
+        initProgressStorage()
+        game.playerId = uid
+        game.playerName = prefs.getString("player_name", "").orEmpty()
+        game.previousStateForName = Game.State.MENU
+        game.accountIsGuest = FirebaseAuth.getInstance().currentUser?.isAnonymous == true
+        game.state = Game.State.AUTH_LOADING
 
-        game.playerName = prefs.getString("player_name", "") ?: ""
-
-        val hasName = prefs.getBoolean("has_name", false)
-        if (!hasName) {
-            game.playerName = ""
-            game.previousStateForName = Game.State.NAME_ENTRY
-            game.state = Game.State.NAME_ENTRY
-        } else {
-            game.state = Game.State.MENU
-        }
-
-        leaderboard.signInAnonymously { }
-
-        game.currentMode = prefs.getInt("current_mode", 0)
-        game.isTiltMode = prefs.getBoolean("is_tilt_mode", false)
+        game.currentMode = devicePrefs.getInt("current_mode", 0)
+        game.isTiltMode = devicePrefs.getBoolean("is_tilt_mode", false)
         game.totalOrbs = prefs.getInt("total_orbs", 0)
 
-        game.particleColor1 = prefs.getInt("color1", Color.WHITE)
-        game.particleColor2 = prefs.getInt("color2", Color.parseColor("#88CCFF"))
-        game.hue1 = prefs.getFloat("hue1", 0f)
-        game.hue2 = prefs.getFloat("hue2", 200f)
+        game.particleColor1 = devicePrefs.getInt("color1", Color.WHITE)
+        game.particleColor2 = devicePrefs.getInt("color2", Color.parseColor("#88CCFF"))
+        game.hue1 = devicePrefs.getFloat("hue1", 0f)
+        game.hue2 = devicePrefs.getFloat("hue2", 200f)
 
         loadHighScore()
         loadSavedImages()
@@ -120,14 +306,18 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         game.saveAchievementCallback = { id ->
             prefs.edit().putBoolean("ach_${id}_v3", true).apply()
             checkGlobalAchievements()
+            progressChanged()
         }
 
         game.saveOrbsCallback = { orbs ->
-            prefs.edit().putInt("total_orbs", orbs).apply()
+            val delta = (orbs.toLong() - prefs.getInt("total_orbs", 0).toLong()).coerceAtLeast(0L)
+            val earned = prefs.getLong("progress_earned", 0L)
+            prefs.edit().putInt("total_orbs", orbs).putLong("progress_earned", (earned + delta).coerceAtMost(9_000_000_000_000_000L)).apply()
+            progressChanged()
         }
 
         game.saveColorsCallback = { c1, c2, h1, h2 ->
-            prefs.edit().putInt("color1", c1).putInt("color2", c2).putFloat("hue1", h1).putFloat("hue2", h2).apply()
+            devicePrefs.edit().putInt("color1", c1).putInt("color2", c2).putFloat("hue1", h1).putFloat("hue2", h2).apply()
         }
     }
 
@@ -165,15 +355,31 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 else -> "high_multiball"
             }
             prefs.edit().putInt(key, game.highScore).apply()
+            progressChanged()
         }
 
-        val modeStr = when (game.currentMode) {
-            0 -> "Classic"
-            1 -> "Tilt"
-            2 -> "Hearts"
-            else -> "MultiBall"
+        // Queue only scores actually earned in this version, not imported legacy records.
+        val mode = game.currentMode.coerceIn(0, 3)
+        val key = "pending_online_score_$mode"
+        prefs.edit().putInt(key, maxOf(prefs.getInt(key, -1), game.score)).apply()
+        progressChanged()
+    }
+
+    private fun sendPendingScores() {
+        if (game.playerName.isBlank() || FirebaseAuth.getInstance().currentUser?.uid != uid) return
+        val modes = listOf("Classic", "Tilt", "Hearts", "MultiBall")
+        for (i in modes.indices) {
+            val key = "pending_online_score_$i"
+            val value = prefs.getInt(key, -1)
+            if (value < 0 || !scoresInFlight.add(i)) continue
+            leaderboard.submitScore(uid, game.playerName, value, modes[i]) { success, _ ->
+                synchronized(this) {
+                    scoresInFlight.remove(i)
+                    if (!progressAttached || FirebaseAuth.getInstance().currentUser?.uid != uid) return@synchronized
+                    if (success && prefs.getInt(key, -1) <= value) prefs.edit().remove(key).apply()
+                }
+            }
         }
-        leaderboard.submitScore(game.playerId, game.playerName, game.score, modeStr) { _, _ -> }
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
@@ -254,51 +460,47 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
 
+    @Synchronized
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (game.state == Game.State.AUTH_LOADING) {
+            if (e.action == MotionEvent.ACTION_DOWN && game.accountLoadError && game.retryAccountBtn.contains(e.x, e.y)) loadAccountProfile()
+            return true
+        }
+        if (game.state == Game.State.ACCOUNT) {
+            if (e.action == MotionEvent.ACTION_DOWN && !game.accountBusy && game.menuAnimProgress >= 0.99f) {
+                val actions = if (game.accountIsGuest) listOf("register", "login", "reset", "back") else listOf("reset", "logout", "back")
+                for ((i, action) in actions.withIndex()) {
+                    if (game.accountButtons[i].contains(e.x, e.y)) {
+                        if (action == "back") game.openMenu(game.accountReturnState) else onAccountAction?.invoke(action)
+                        break
+                    }
+                }
+            }
+            return true
+        }
         if (game.state == Game.State.NAME_ENTRY) {
-            if (e.action == MotionEvent.ACTION_DOWN) {
+            if (e.action == MotionEvent.ACTION_DOWN && !nicknameSaving && game.menuAnimProgress >= 0.99f) {
                 if (game.nameInputRect.contains(e.x, e.y)) {
                     game.errorMessage = ""
                     onShowKeyboard?.invoke()
                 } else if (game.nameAcceptBtnRect.contains(e.x, e.y)) {
                     val newName = game.playerName.trim()
-                    if (newName.isBlank()) {
-                        game.errorMessage = game.t("Введите ник!")
-                    } else {
-                        game.errorMessage = "" // Сбрасываем ошибку перед проверкой
-                        onHideKeyboard?.invoke()
-                        val oldName = prefs.getString("player_name", "") ?: ""
-                        leaderboard.checkAndSaveNickname(game.playerId, oldName, newName) { success, error ->
-                            post {
-                                if (success) {
-                                    game.playerName = newName
-                                    prefs.edit().putString("player_name", game.playerName).putBoolean("has_name", true).apply()
-                                    game.openMenu(game.previousStateForName)
-                                } else {
-                                    // Не сохраняем занятый ник; оставляем его в поле для исправления
-                                    game.playerName = newName
-                                    game.errorMessage = game.t(error ?: "Ошибка проверки ника")
-                                }
-                            }
-                        }
-                    }
-                } else if (game.nameDeclineBtnRect.contains(e.x, e.y)) {
-                    if (game.previousStateForName == Game.State.SETTINGS) {
-                        game.playerName = prefs.getString("player_name", "") ?: ""
+                    if (newName.isBlank()) game.errorMessage = "Введите ник!"
+                    else {
                         game.errorMessage = ""
                         onHideKeyboard?.invoke()
-                        game.openMenu(Game.State.SETTINGS)
-                    } else {
-                        onHideKeyboard?.invoke()
-                        game.showConfirmation("Остаться анонимным? Будет присвоен случайный ник.") {
-                            val randomSuffix = (1000..9999).random()
-                            val anonName = "Отказался_$randomSuffix"
-                            game.playerName = anonName
-                            prefs.edit().putString("player_name", game.playerName).putBoolean("has_name", true).apply()
-                            leaderboard.checkAndSaveNickname(game.playerId, "", game.playerName) { _, _ -> }
-                            game.openMenu(Game.State.MENU)
-                        }
+                        saveNickname(newName)
                     }
+                } else if (game.nameDeclineBtnRect.contains(e.x, e.y)) {
+                    onHideKeyboard?.invoke()
+                    if (game.previousStateForName == Game.State.SETTINGS) {
+                        game.playerName = prefs.getString("player_name", "").orEmpty()
+                        game.openMenu(Game.State.SETTINGS)
+                    } else if (game.accountIsGuest) {
+                        saveNickname("Guest_${uid.take(8)}_${(1000..9999).random()}", random = true)
+                    } else game.errorMessage = "Введите ник!"
+                } else if (game.nameAccountBtnRect.contains(e.x, e.y)) {
+                    openAccount(Game.State.NAME_ENTRY)
                 }
             }
             return true
@@ -443,6 +645,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             }
 
             if (game.state == Game.State.MENU) {
+                if (!game.isMenuPhysicsEnabled && game.menuAnimProgress >= 0.99f && game.accountBtnRect.contains(e.x, e.y)) {
+                    openAccount(Game.State.MENU)
+                    return true
+                }
                 if (game.helpBtnRect.contains(e.x, e.y)) {
                     game.isMenuPhysicsEnabled = !game.isMenuPhysicsEnabled
                     if (game.isMenuPhysicsEnabled) {
@@ -454,6 +660,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                         val cSecondary = android.graphics.Color.parseColor("#2A2A2A")
                         val cDanger = android.graphics.Color.parseColor("#EF5350")
 
+                        game.fallingButtons.add(FallingButton(left, safe.top + 135f, btnW, btnH, "Аккаунт", cSecondary, Game.State.ACCOUNT))
                         game.fallingButtons.add(FallingButton(left, safe.top + 480f, btnW, btnH, "Играть", cPrimary, Game.State.PLAYING))
                         game.fallingButtons.add(FallingButton(left, safe.top + 570f, btnW, btnH, "Режимы", cSecondary, Game.State.MODES))
                         game.fallingButtons.add(FallingButton(left, safe.top + 660f, btnW, btnH, "Рейтинг", cSecondary, Game.State.LEADERBOARD))
@@ -475,6 +682,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                                 Game.State.LEADERBOARD -> {
                                     game.closeMenu(Game.State.LEADERBOARD_MODES)
                                 }
+                                Game.State.ACCOUNT -> openAccount(Game.State.MENU)
                                 Game.State.SETTINGS -> game.closeMenu(Game.State.SETTINGS)
                                 Game.State.ACHIEVEMENTS -> game.closeMenu(Game.State.ACHIEVEMENTS)
                                 else -> {}
@@ -555,7 +763,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     game.btnModeClassic.contains(e.x, e.y) -> {
                         game.currentMode = 0
                         game.isTiltMode = false
-                        prefs.edit().putInt("current_mode", 0).putBoolean("is_tilt_mode", false).putBoolean("played_mode_0", true).apply()
+                        devicePrefs.edit().putInt("current_mode", 0).putBoolean("is_tilt_mode", false).apply()
+                        prefs.edit().putBoolean("played_mode_0", true).apply()
+                        progressChanged()
                         loadHighScore()
                         checkGlobalAchievements()
                         game.closeMenu(Game.State.PLAYING, restart = true)
@@ -563,7 +773,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     game.btnModeTilt.contains(e.x, e.y) -> {
                         game.currentMode = 1
                         game.isTiltMode = true
-                        prefs.edit().putInt("current_mode", 1).putBoolean("is_tilt_mode", true).putBoolean("played_mode_1", true).apply()
+                        devicePrefs.edit().putInt("current_mode", 1).putBoolean("is_tilt_mode", true).apply()
+                        prefs.edit().putBoolean("played_mode_1", true).apply()
+                        progressChanged()
                         loadHighScore()
                         checkGlobalAchievements()
                         game.closeMenu(Game.State.PLAYING, restart = true)
@@ -571,7 +783,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     game.btnModeHearts.contains(e.x, e.y) -> {
                         game.currentMode = 2
                         game.isTiltMode = false
-                        prefs.edit().putInt("current_mode", 2).putBoolean("is_tilt_mode", false).putBoolean("played_mode_2", true).apply()
+                        devicePrefs.edit().putInt("current_mode", 2).putBoolean("is_tilt_mode", false).apply()
+                        prefs.edit().putBoolean("played_mode_2", true).apply()
+                        progressChanged()
                         loadHighScore()
                         checkGlobalAchievements()
                         game.closeMenu(Game.State.PLAYING, restart = true)
@@ -579,9 +793,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     game.btnModeNew.contains(e.x, e.y) -> {
                         game.currentMode = 3
                         game.isTiltMode = false
-                        prefs.edit().putInt("current_mode", 3)
+                        devicePrefs.edit().putInt("current_mode", 3)
                             .putBoolean("is_tilt_mode", false)
-                            .putBoolean("played_mode_3", true).apply()
+                            .apply()
+                        prefs.edit().putBoolean("played_mode_3", true).apply()
+                        progressChanged()
                         loadHighScore()
                         checkGlobalAchievements()
                         game.closeMenu(Game.State.PLAYING, restart = true)
@@ -627,9 +843,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                             putBoolean("played_mode_1", false)
                             putBoolean("played_mode_2", false)
                             putBoolean("played_mode_3", false)
+                            putString("progress_reset_pending", UUID.randomUUID().toString())
                             apply()
                         }
                         for (ach in game.achievementsList) ach.isUnlocked = false
+                        progressChanged()
                     }
                 }
                 return true
@@ -662,7 +880,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     game.languageBtnRect.contains(e.x, e.y) -> {
                         game.language = if (game.language == "ru") "en" else "ru"
                         game.animateLanguageSwitch()
-                        prefs.edit().putString("ui_language", game.language).apply()
+                        devicePrefs.edit().putString("ui_language", game.language).apply()
                     }
                     game.backBtnRect.contains(e.x, e.y) -> game.closeMenu(game.previousState)
                 }
@@ -688,62 +906,70 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     }
                     game.resetColorsBtnRect.contains(e.x, e.y) -> {
                         game.showConfirmation("Сбросить цвета?") {
-                            game.particleColor1 = Цвет.БЕЛЫЙ
+                            game.particleColor1 = Color.WHITE
                             game.particleColor2 = Color.parseColor("#88CCFF")
-                            игра.оттенок1 = 0ф
-                            игра.оттенок2 = 200ф
-                            игра.редактированиеЦвет1 = истинный
+                            game.hue1 = 0f
+                            game.hue2 = 200f
+                            game.editingColor1 = true
                             game.saveColorsCallback?.invoke(game.particleColor1, game.particleColor2, game.hue1, game.hue2)
                         }
                     }
-                    game.backFromColorsBtnRect.contains(ex, ey) -> game.closeMenu(Game.State.SETTINGS)
+                    game.backFromColorsBtnRect.contains(e.x, e.y) -> game.closeMenu(Game.State.SETTINGS)
                 }
-                возвращаться истинный
+                return true
             }
 
-            эсли (game.pauseBtnRect.contains(ex, ey)) {
-                game.openMenu(Состоение.Игры.ПРИОСТАНОВЛЕНО)
-                возвращаться истинный
+            if (game.pauseBtnRect.contains(e.x, e.y)) {
+                game.openMenu(Game.State.PAUSED)
+                return true
             }
         }
 
-        эсли (game.state == Game.State.PLAYING) {
-            эсли (game.currentMode == 1) {
-                game.hasTouchedInTiltMode = игровой
+        if (game.state == Game.State.PLAYING) {
+            if (game.currentMode == 1) {
+                game.hasTouchedInTiltMode = true
             }
 
-            если (!game.isTiltMode) {
-                эсли (e.action == MotionEvent.ACTION_MOVE || e.action == MotionEvent.ACTION_DOWN) {
-                    game.paddleX = excoerceIn(
-                        safe.left + game.paddleW/ 2,
-                        ширина - safe.right - game.paddleW / 2
+            if (!game.isTiltMode) {
+                if (e.action == MotionEvent.ACTION_MOVE || e.action == MotionEvent.ACTION_DOWN) {
+                    game.paddleX = e.x.coerceIn(
+                        safe.left + game.paddleW / 2,
+                        width - safe.right - game.paddleW / 2
                     )
                 }
             }
         }
-        возвращаться истинный
+        return true
     }
 
-    веселье шаг(dt: Плавающий) {
-        вал токащийPaddleY = высота - безпасное.дно - 100ф
+    @Synchronized
+    fun step(dt: Float) {
+        val currentPaddleY = height - safe.bottom - 100f
         game.update(dt, safe, width, currentPaddleY)
 
-        эсли (game.vibrateTrigger) {
-            game.vibrateTrigger = ложный
-            эсли (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                вибратор?.vibrate(VibrationEffect.createOneShot(30, VibrationEffect.DEFAULT_AMPLITUDE))
-            } еще {
-                @Подавить("УСТАРЕВАНИЕ")
-                вибратор?.вибрировать(30)
+        if (game.vibrateTrigger) {
+            game.vibrateTrigger = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(VibrationEffect.createOneShot(30, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(30)
             }
         }
 
-        эсли (game.state == Game.State.GAME_OVER) {
-            сохранитьВысокийСчет()
+        if (game.state == Game.State.GAME_OVER && !scoreSavedForRound) {
+            scoreSavedForRound = true
+            prefs.edit().putBoolean("played_mode_${game.currentMode}", true).apply()
+            checkGlobalAchievements()
+            saveHighScore()
+            progressChanged()
+        } else if (game.state == Game.State.PLAYING) {
+            scoreSavedForRound = false
         }
     }
 
-    веселье ничьяИгра(c: Холсst) {
-        game.render(c, безопасно)
+    @Synchronized
+    fun drawGame(c: Canvas) {
+        game.render(c, safe)
     }
 }
